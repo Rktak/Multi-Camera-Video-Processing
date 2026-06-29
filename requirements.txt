@@ -1,0 +1,35 @@
+# ─────────────────────────────────────────────────────────────────
+# Multi-Camera Multi-Object Tracking (MCMOT) — Dependencies
+# Install with:  pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────────────
+
+# --- Web Framework ---
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0       # ASGI server with hot-reload support
+python-multipart>=0.0.9         # Required for FastAPI file uploads
+aiofiles>=23.2.0                # Async file I/O for saving uploads
+
+# --- Database ---
+sqlalchemy>=2.0.0               # ORM (Object-Relational Mapper)
+psycopg2-binary>=2.9.9          # PostgreSQL driver (binary = no compile needed)
+python-dotenv>=1.0.0            # Load .env variables
+
+# --- Computer Vision & Detection ---
+ultralytics>=8.2.0              # YOLOv8 + ByteTrack (all-in-one package)
+opencv-python>=4.10.0           # Video I/O and frame processing
+
+# --- Deep Learning (Re-ID Feature Extraction) ---
+torch>=2.3.0                    # PyTorch (GPU-accelerated inference)
+torchvision>=0.18.0             # MobileNetV3 pretrained weights
+
+# --- Math / Similarity ---
+numpy>=1.26.0                   # Array operations
+scipy>=1.13.0                   # Cosine distance calculation
+
+# --- Frontend ---
+streamlit>=1.35.0               # Interactive web UI
+requests>=2.32.0                # HTTP client for UI → API calls
+
+# --- Utilities ---
+pillow>=10.3.0                  # Image format conversions (PIL)
+pandas>=2.2.0                   # Tabular data display in Streamlit
