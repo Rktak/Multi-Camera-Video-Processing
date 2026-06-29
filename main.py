@@ -217,6 +217,15 @@ async def upload_videos(
     JOB_REGISTRY[job_id] = {
         "status": "pending",
         "videos": [os.path.basename(p) for p in saved_paths],
+        "video_progress": {
+            # Per-video progress — updated in real-time by progress_callback
+            os.path.basename(p): {
+                "frames_done": 0,
+                "total_frames": 0,
+                "status": "pending",   # pending | processing | done | error
+            }
+            for p in saved_paths
+        },
         "results": [],
         "error": None,
         "started_at": datetime.utcnow().isoformat(),
@@ -286,6 +295,10 @@ async def _process_videos_job(
             # Ensure output is always .mp4 (even if input was .avi)
             output_filename = os.path.splitext(output_filename)[0] + ".mp4"
             output_path = os.path.join(output_dir, output_filename)
+            video_key = os.path.basename(video_path)
+
+            # Mark this video as "processing" in the registry
+            JOB_REGISTRY[job_id]["video_progress"][video_key]["status"] = "processing"
 
             # run_in_executor submits the blocking function to the thread pool
             task = loop.run_in_executor(
@@ -294,6 +307,8 @@ async def _process_videos_job(
                 video_path,             # Arguments to pass to it
                 output_path,
                 frame_skip,
+                job_id,                 # For progress callback
+                video_key,              # For progress callback
             )
             tasks.append(task)
 
@@ -306,8 +321,16 @@ async def _process_videos_job(
         for idx, result in enumerate(results):
             if isinstance(result, Exception):
                 errors.append(f"Video {idx + 1}: {str(result)}")
+                # Mark the specific video as errored if we can identify it
+                video_keys = list(JOB_REGISTRY[job_id]["video_progress"].keys())
+                if idx < len(video_keys):
+                    JOB_REGISTRY[job_id]["video_progress"][video_keys[idx]]["status"] = "error"
             else:
                 summaries.append(result)
+                # Mark the specific video as done
+                v_source = result.get("video_source", "")
+                if v_source in JOB_REGISTRY[job_id]["video_progress"]:
+                    JOB_REGISTRY[job_id]["video_progress"][v_source]["status"] = "done"
 
         if errors:
             JOB_REGISTRY[job_id]["status"] = "error"
@@ -329,19 +352,44 @@ def _sync_track_video(
     video_path: str,
     output_path: str,
     frame_skip: int,
+    job_id: str,
+    video_key: str,
 ) -> dict:
     """
     Synchronous (blocking) wrapper called from the thread pool.
     This is the actual CPU-heavy work that runs in a separate thread.
     Each thread creates and manages its own independent database session.
+
+    A progress_callback is wired up here so that track_video() can
+    report (frames_done, total_frames) every 10 frames, allowing the
+    frontend to show per-video progress bars in real-time.
     """
+    def _progress_cb(frames_done: int, total_frames: int) -> None:
+        """Write progress into the shared JOB_REGISTRY (thread-safe for dict key writes)."""
+        try:
+            vp = JOB_REGISTRY[job_id]["video_progress"][video_key]
+            vp["frames_done"]  = frames_done
+            vp["total_frames"] = total_frames
+        except KeyError:
+            pass  # Job was cleared — silently ignore
+
     db = SessionLocal()
     try:
+        # Seed total_frames immediately from the video header so the UI
+        # can show a denominator before the first 10-frame callback fires.
+        import cv2 as _cv2
+        _cap = _cv2.VideoCapture(video_path)
+        if _cap.isOpened():
+            _total = int(_cap.get(_cv2.CAP_PROP_FRAME_COUNT))
+            _cap.release()
+            JOB_REGISTRY[job_id]["video_progress"][video_key]["total_frames"] = _total
+
         return tracker.track_video(
             video_path=video_path,
             output_path=output_path,
             db_session=db,
             frame_skip=frame_skip,
+            progress_callback=_progress_cb,
         )
     finally:
         db.close()

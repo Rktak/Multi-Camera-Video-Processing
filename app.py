@@ -358,10 +358,20 @@ with tab_upload:
                     )
 
                     # ── Polling Loop ──────────────────────────────────
-                    st.write("⏳ Processing (polling every 3s)...")
-                    progress_bar = st.progress(0.0, text="Waiting for tracker...")
+                    st.write("📡 Processing videos in parallel — polling every 3s...")
+
+                    # Build per-video progress UI once (updated in-place each poll)
+                    video_names = [f.name for f in uploaded_files]
+                    progress_containers = {}
+                    for vname in video_names:
+                        st.markdown(f"&nbsp;&nbsp;&nbsp;📹 **{vname}**")
+                        progress_containers[vname] = {
+                            "bar":   st.progress(0.0),
+                            "label": st.empty(),
+                        }
+
+                    overall_label = st.empty()
                     elapsed = 0
-                    estimated_pct = 0.0
 
                     while elapsed < MAX_POLL_SECONDS:
                         time.sleep(POLL_INTERVAL_S)
@@ -372,16 +382,50 @@ with tab_upload:
                         )
                         job_status = poll_resp.json()
                         current_status = job_status["status"]
+                        video_progress = job_status.get("video_progress", {})
 
-                        # Slowly advance progress bar while unknown duration
-                        estimated_pct = min(0.92, elapsed / MAX_POLL_SECONDS * 6)
-                        progress_bar.progress(
-                            estimated_pct,
-                            text=f"Status: `{current_status}` — {elapsed}s elapsed"
+                        # ── Update per-video bars ──────────────────────
+                        for vname, container in progress_containers.items():
+                            # Backend sanitizes spaces → underscores in filenames
+                            safe_name = vname.replace(" ", "_")
+                            vp = (
+                                video_progress.get(safe_name)
+                                or video_progress.get(vname)
+                                or {}
+                            )
+
+                            frames_done  = vp.get("frames_done",  0)
+                            total_frames = vp.get("total_frames", 0)
+                            vstatus      = vp.get("status", "pending")
+
+                            if vstatus == "done":
+                                pct        = 1.0
+                                label_text = f"✅ Done — {total_frames:,} frames"
+                            elif vstatus == "error":
+                                pct        = 1.0
+                                label_text = "❌ Error during processing"
+                            elif total_frames > 0:
+                                pct = min(frames_done / total_frames, 1.0)
+                                label_text = (
+                                    f"⚙️ {frames_done:,} / {total_frames:,} frames"
+                                    f" ({pct:.0%})"
+                                )
+                            elif vstatus == "processing":
+                                pct        = 0.02
+                                label_text = "⏳ Starting..."
+                            else:
+                                pct        = 0.0
+                                label_text = "⏸ Pending..."
+
+                            container["bar"].progress(pct)
+                            container["label"].caption(label_text)
+
+                        overall_label.info(
+                            f"🟡 Overall: `{current_status}` — {elapsed}s elapsed"
                         )
 
                         if current_status == "done":
-                            progress_bar.progress(1.0, text="✅ Complete!")
+                            overall_label.success("✅ All videos complete!")
                             status_box.update(
                                 label="✅ All Videos Processed!",
                                 state="complete",
@@ -396,7 +440,7 @@ with tab_upload:
                             break
 
                         elif current_status == "error":
-                            progress_bar.progress(estimated_pct, text="❌ Error")
+                            overall_label.error("❌ Processing failed")
                             status_box.update(label="❌ Processing Failed", state="error")
                             err_msg = job_status.get("error", "Unknown error")
                             st.error(f"**Error:** {err_msg}")

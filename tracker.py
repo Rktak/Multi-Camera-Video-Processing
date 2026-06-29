@@ -55,7 +55,7 @@ import os
 import time
 import threading
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -336,9 +336,15 @@ class MultiVideoTracker:
 
         Algorithm:
             1. Rebuild the flat [N×576] embedding matrix if the cache changed.
-            2. One matmul → [N] similarity scores.
-            3. If max score ≥ threshold  → assign that global ID + EMA update.
-            4. Else                       → mint a new global ID.
+            2. Snapshot matrix references under lock, then release lock.
+            3. Run the heavy matmul OUTSIDE the lock (no contention).
+            4. Re-acquire lock only for the write mutation (insert / EMA update).
+
+        Parallelism note:
+            Previously the lock was held for the full method including matmul,
+            causing threads processing different videos to serialize.
+            Now the lock is held only for cheap dict reads/writes, so two
+            threads can run their matmuls simultaneously.
 
         Args:
             features:      L2-normalized embedding of shape [576].
@@ -347,10 +353,14 @@ class MultiVideoTracker:
         Returns:
             Assigned global_person_id (int ≥ 1).
         """
+        feat_f32 = features.astype(np.float32)
+
+        # ── Phase 1: read snapshot under lock (cheap) ─────────────────
         with self.lock:
             if not self.global_id_cache:
+                # Cache is empty — just create first ID
                 gid = self.next_global_id
-                self.global_id_cache[gid] = [features.copy()]
+                self.global_id_cache[gid] = [feat_f32.copy()]
                 self.dirty_identities[gid] = self.global_id_cache[gid]
                 self.next_global_id += 1
                 self._cache_dirty = True
@@ -362,37 +372,47 @@ class MultiVideoTracker:
 
             if self._emb_matrix is None:
                 gid = self.next_global_id
-                self.global_id_cache[gid] = [features.copy()]
+                self.global_id_cache[gid] = [feat_f32.copy()]
                 self.dirty_identities[gid] = self.global_id_cache[gid]
                 self.next_global_id += 1
                 self._cache_dirty = True
                 return gid
 
-            # ── ONE matmul replaces the entire nested for-loop ────────
-            # [N, 576] @ [576] → [N]  (dot product == cosine sim for unit vecs)
-            feat_f32 = features.astype(np.float32)
-            similarities = self._emb_matrix @ feat_f32   # [N]
-            best_flat_idx = int(np.argmax(similarities))
-            best_similarity = float(similarities[best_flat_idx])
-            best_gid, best_view_idx = self._emb_gid_view[best_flat_idx]
+            # Snapshot references (not deep copies — arrays are read-only here)
+            emb_matrix_snap = self._emb_matrix        # np.ndarray reference
+            gid_view_snap   = self._emb_gid_view      # list reference
+            threshold_snap  = self.similarity_threshold
+        # ── Lock released — heavy compute runs in parallel ────────────
 
-            if best_similarity >= self.similarity_threshold:
-                # ── Match found ──────────────────────────────────────────
+        # ── Phase 2: similarity computation outside lock ───────────────
+        # [N, 576] @ [576] → [N]  (dot product == cosine sim for unit vecs)
+        similarities    = emb_matrix_snap @ feat_f32  # [N]
+        best_flat_idx   = int(np.argmax(similarities))
+        best_similarity = float(similarities[best_flat_idx])
+        best_gid, best_view_idx = gid_view_snap[best_flat_idx]
+
+        # ── Phase 3: write mutation under lock (cheap) ────────────────
+        with self.lock:
+            if best_similarity >= threshold_snap:
+                # ── Match found — EMA update ──────────────────────────
                 if not is_overlapping:
-                    alpha = 0.9  # EMA smoothing factor
-                    matched_emb = self.global_id_cache[best_gid][best_view_idx]
-                    updated = alpha * matched_emb + (1 - alpha) * feat_f32
-                    updated_norm = np.linalg.norm(updated)
-                    self.global_id_cache[best_gid][best_view_idx] = (
-                        updated / updated_norm if updated_norm > 0 else updated
-                    )
-                    self.dirty_identities[best_gid] = self.global_id_cache[best_gid]
-                    self._cache_dirty = True  # Matrix stale after EMA update
+                    # Guard: cache entry may have been mutated by another thread
+                    if best_gid in self.global_id_cache and \
+                            best_view_idx < len(self.global_id_cache[best_gid]):
+                        alpha = 0.9  # EMA smoothing factor
+                        matched_emb = self.global_id_cache[best_gid][best_view_idx]
+                        updated = alpha * matched_emb + (1 - alpha) * feat_f32
+                        updated_norm = np.linalg.norm(updated)
+                        self.global_id_cache[best_gid][best_view_idx] = (
+                            updated / updated_norm if updated_norm > 0 else updated
+                        )
+                        self.dirty_identities[best_gid] = self.global_id_cache[best_gid]
+                        self._cache_dirty = True  # Matrix stale after EMA update
                 return best_gid
             else:
-                # ── New person detected ───────────────────────────────────
+                # ── New person — mint a new global ID ─────────────────
                 gid = self.next_global_id
-                self.global_id_cache[gid] = [features.copy()]
+                self.global_id_cache[gid] = [feat_f32.copy()]
                 self.dirty_identities[gid] = self.global_id_cache[gid]
                 self.next_global_id += 1
                 self._cache_dirty = True
@@ -682,18 +702,22 @@ class MultiVideoTracker:
         db_session,
         db_batch_size: int = 50,
         frame_skip: int = 1,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> dict:
         """
         Full pipeline for a single video file:
             Read frames → Detect+Track+Re-ID → Write annotated video → Log to DB
 
         Args:
-            video_path:    Absolute path to the input video file.
-            output_path:   Absolute path to save the annotated output video.
-            db_session:    SQLAlchemy session (from SessionLocal()).
-            db_batch_size: Flush DB records every N detections (improves perf).
-            frame_skip:    Process every Nth frame (1=all frames, 2=every other).
-                           Use 2 or 3 for faster processing at lower accuracy.
+            video_path:       Absolute path to the input video file.
+            output_path:      Absolute path to save the annotated output video.
+            db_session:       SQLAlchemy session (from SessionLocal()).
+            db_batch_size:    Flush DB records every N detections (improves perf).
+            frame_skip:       Process every Nth frame (1=all frames, 2=every other).
+                              Use 2 or 3 for faster processing at lower accuracy.
+            progress_callback: Optional callable(frames_done: int, total_frames: int).
+                              Called every 10 frames so callers can surface
+                              per-video progress without expensive polling overhead.
 
         Returns:
             Summary dict with processing statistics.
@@ -759,6 +783,13 @@ class MultiVideoTracker:
                 pending_records.clear()
 
             frame_number += 1
+
+            # ── Progress reporting (every 10 frames, low overhead) ────
+            if progress_callback is not None and frame_number % 10 == 0:
+                try:
+                    progress_callback(frame_number, total_frames)
+                except Exception:
+                    pass  # Never let a broken callback kill video processing
 
             # Progress log every 100 frames
             if frame_number % 100 == 0:
