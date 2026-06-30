@@ -823,12 +823,42 @@ class GlobalIdentityManager:
         Flatten _gallery into a [N, dim] matrix and parallel gid list.
         Called lazily when _matrix_dirty is True (inside lock).
         """
+        # Determine the target dimension, prioritizing newly added/dirty embeddings
+        target_dim = None
+        for embs in self._dirty.values():
+            if embs:
+                target_dim = embs[-1].shape[0]
+                break
+                
+        if target_dim is None:
+            # Fallback to the most frequent dimension
+            dim_counts = {}
+            for embs in self._gallery.values():
+                for emb in embs:
+                    dim_counts[emb.shape[0]] = dim_counts.get(emb.shape[0], 0) + 1
+            if dim_counts:
+                target_dim = max(dim_counts.items(), key=lambda x: x[1])[0]
+
         rows: List[np.ndarray] = []
         gids: List[int] = []
-        for gid, embs in self._gallery.items():
-            for emb in embs:
-                rows.append(emb)
-                gids.append(gid)
+        
+        for gid in list(self._gallery.keys()):
+            embs = self._gallery[gid]
+            valid_embs = [e for e in embs if target_dim is None or e.shape[0] == target_dim]
+            
+            if not valid_embs:
+                # Discard global IDs that have no valid embeddings (e.g. from an older model)
+                del self._gallery[gid]
+                if gid in self._temporal:
+                    del self._temporal[gid]
+                if gid in self._dirty:
+                    del self._dirty[gid]
+            else:
+                self._gallery[gid] = valid_embs
+                for emb in valid_embs:
+                    rows.append(emb)
+                    gids.append(gid)
+
         self._emb_gids = gids
         self._emb_matrix = np.array(rows, dtype=np.float32) if rows else None
         self._matrix_dirty = False
