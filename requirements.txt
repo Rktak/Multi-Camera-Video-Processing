@@ -21,6 +21,7 @@ opencv-python>=4.10.0           # Video I/O and frame processing
 # --- Deep Learning (Re-ID Feature Extraction) ---
 torch>=2.3.0                    # PyTorch (GPU-accelerated inference)
 torchvision>=0.18.0             # MobileNetV3 pretrained weights
+torchreid>=0.2.5                # OSNet / OSNet-AIN person Re-ID models
 
 # --- Math / Similarity ---
 numpy>=1.26.0                   # Array operations

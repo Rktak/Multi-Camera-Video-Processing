@@ -166,6 +166,9 @@ class TrackingConfig:
     yolo_pool_size: int = 2
     db_batch_size: int = 50
     min_gallery_for_match: int = 2
+    reid_model: str = "osnet_ain"          # "osnet_ain" | "osnet" | "mobilenetv3"
+    reid_weights_path: Optional[str] = None  # Custom .pth path (auto-download if None)
+    supervised_mode: bool = False            # If True, only match against taught named identities
 
     def __post_init__(self):
         # Normalise weights so they always sum to 1.0
@@ -182,16 +185,14 @@ class TrackingConfig:
 
 class ReIDFeatureExtractor:
     """
-    Pluggable appearance feature extractor for Re-ID.
+    Legacy appearance feature extractor for Re-ID (MobileNetV3-Small).
 
-    Currently uses MobileNetV3-Small with the classifier head removed,
-    producing a 576-dimensional L2-normalised embedding per crop.
+    Produces a 576-dimensional L2-normalised embedding per crop using
+    MobileNetV3-Small with the classifier head removed.
 
-    To swap in a stronger model (e.g. OSNet, ResNet50-IBN, CLIP):
-        1. Subclass ReIDFeatureExtractor
-        2. Override __init__ to load your model
-        3. Override _forward_batch() to run the new model
-        4. Pass your subclass instance to MultiVideoTrackingEngine.__init__()
+    For better Re-ID accuracy, use OSNetReIDExtractor instead (the new
+    default). This class is kept for backward compatibility and as a
+    lightweight fallback when torchreid is not installed.
 
     The rest of the pipeline (LocalTrackProfile, GlobalIdentityManager)
     is model-agnostic — they just work with L2-normalised numpy arrays.
@@ -278,6 +279,176 @@ class ReIDFeatureExtractor:
         """Convenience wrapper for a single crop (uses batch internally)."""
         result = self.extract_batch([crop_bgr])
         return result[0]
+
+
+class OSNetReIDExtractor:
+    """
+    Person Re-ID feature extractor using OSNet / OSNet-AIN from torchreid.
+
+    OSNet (Omni-Scale Network) is a lightweight CNN specifically designed
+    for person re-identification. OSNet-AIN adds Instance Normalization
+    for robustness to cross-camera style/lighting variations.
+
+    Produces a 512-dimensional L2-normalised embedding per crop.
+    Pretrained on Market1501 for person Re-ID (not ImageNet).
+
+    Input crop size: 256×128 (standard ReID resolution).
+
+    Supported model_name values:
+        - 'osnet_ain_x1_0'  (recommended — best cross-camera accuracy)
+        - 'osnet_x1_0'      (slightly faster, no instance norm)
+        - 'osnet_x0_75'     (smaller variant)
+
+    The public API (extract_batch, extract_single) is identical to
+    ReIDFeatureExtractor so the rest of the pipeline works unchanged.
+    """
+
+    EMB_DIM = 512  # OSNet output dimension
+
+    # Model name mapping for user-friendly config values
+    _MODEL_MAP = {
+        "osnet_ain": "osnet_ain_x1_0",
+        "osnet":     "osnet_x1_0",
+    }
+
+    def __init__(
+        self,
+        device: str = "cpu",
+        model_name: str = "osnet_ain",
+        weights_path: Optional[str] = None,
+    ) -> None:
+        self.device = device
+        self._torchreid_name = self._MODEL_MAP.get(model_name, model_name)
+
+        try:
+            from torchreid.reid.utils import FeatureExtractor as TorchreidFE
+        except ImportError:
+            try:
+                from torchreid.utils import FeatureExtractor as TorchreidFE
+            except ImportError:
+                raise ImportError(
+                    "torchreid is required for OSNet Re-ID. "
+                    "Install with: pip install torchreid"
+                )
+
+        # torchreid.FeatureExtractor handles weight download, model build,
+        # and eval mode internally. It accepts image paths OR PIL Images
+        # OR numpy arrays (HWC uint8 BGR/RGB).
+        fe_kwargs = {
+            "model_name": self._torchreid_name,
+            "device": device,
+        }
+        if weights_path:
+            fe_kwargs["model_path"] = weights_path
+
+        self._fe = TorchreidFE(**fe_kwargs)
+        logger.info(
+            "OSNet Re-ID extractor loaded: %s (%d-dim) on %s.",
+            self._torchreid_name, self.EMB_DIM, device.upper(),
+        )
+
+        # ImageNet normalisation constants (same as torchreid uses internally)
+        self._mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        self._std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    def _preprocess(self, crop_bgr: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Convert a BGR crop → normalised CHW float32 numpy array.
+        Uses 256×128 input resolution (standard for person ReID).
+        Returns None if the crop is invalid.
+        """
+        if crop_bgr is None or crop_bgr.size == 0:
+            return None
+        resized = cv2.resize(crop_bgr, (128, 256), interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        rgb = (rgb - self._mean) / self._std
+        return rgb.transpose(2, 0, 1)  # HWC → CHW
+
+    def _forward_batch(self, chw_arrays: List[np.ndarray]) -> np.ndarray:
+        """Run a list of CHW float32 arrays through OSNet. Returns [N, 512]."""
+        batch = torch.from_numpy(np.stack(chw_arrays)).to(self.device)
+        with torch.no_grad():
+            features = self._fe.model(batch)
+        return features.cpu().numpy()
+
+    def extract_batch(
+        self, crops: List[Optional[np.ndarray]]
+    ) -> List[Optional[np.ndarray]]:
+        """
+        Batch feature extraction: one GPU forward pass for all crops.
+
+        Args:
+            crops: List of BGR numpy arrays (or None for invalid slots).
+
+        Returns:
+            List of L2-normalised float32 embeddings (same length as crops).
+            Entries are None for invalid/empty crops.
+        """
+        results: List[Optional[np.ndarray]] = [None] * len(crops)
+        if not crops:
+            return results
+
+        tensors: List[np.ndarray] = []
+        valid_idx: List[int] = []
+
+        for i, crop in enumerate(crops):
+            chw = self._preprocess(crop)
+            if chw is not None:
+                tensors.append(chw)
+                valid_idx.append(i)
+
+        if not tensors:
+            return results
+
+        embeddings = self._forward_batch(tensors)  # [N, 512]
+        for out_i, orig_i in enumerate(valid_idx):
+            emb = embeddings[out_i].astype(np.float32)
+            norm = np.linalg.norm(emb)
+            results[orig_i] = emb / norm if norm > 0 else None
+
+        return results
+
+    def extract_single(self, crop_bgr: np.ndarray) -> Optional[np.ndarray]:
+        """Convenience wrapper for a single crop (uses batch internally)."""
+        result = self.extract_batch([crop_bgr])
+        return result[0]
+
+
+def _build_reid_extractor(
+    config: TrackingConfig,
+    device: str,
+) -> "ReIDFeatureExtractor | OSNetReIDExtractor":
+    """
+    Factory function: build the appropriate Re-ID feature extractor
+    based on config.reid_model.
+
+    Falls back to MobileNetV3 if torchreid is not installed.
+    """
+    model_key = config.reid_model.lower().strip()
+
+    if model_key in ("osnet_ain", "osnet", "osnet_ain_x1_0", "osnet_x1_0"):
+        try:
+            return OSNetReIDExtractor(
+                device=device,
+                model_name=model_key,
+                weights_path=config.reid_weights_path,
+            )
+        except ImportError:
+            logger.warning(
+                "torchreid not installed — falling back to MobileNetV3. "
+                "Install with: pip install torchreid"
+            )
+            return ReIDFeatureExtractor(device=device)
+    elif model_key == "mobilenetv3":
+        return ReIDFeatureExtractor(device=device)
+    else:
+        logger.warning(
+            "Unknown reid_model '%s' — falling back to OSNet-AIN.", model_key
+        )
+        try:
+            return OSNetReIDExtractor(device=device, model_name="osnet_ain")
+        except ImportError:
+            return ReIDFeatureExtractor(device=device)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -526,6 +697,9 @@ class GlobalIdentityManager:
         # {video_source: (start_frame, end_frame)}
         self._temporal: Dict[int, Dict[str, Tuple[int, int]]] = {}
 
+        # Maps global_person_id → name (for supervised taught identities)
+        self._names: Dict[int, Optional[str]] = {}
+
         # Tracks which global IDs have been modified (need DB flush)
         self._dirty: Dict[int, List[np.ndarray]] = {}
 
@@ -555,6 +729,8 @@ class GlobalIdentityManager:
         # Tracks with insufficient gallery evidence always get a new ID
         # to avoid polluting global IDs with noisy short-track embeddings.
         if rep is None or len(profile.gallery) < self.config.min_gallery_for_match:
+            if self.config.supervised_mode:
+                return -1, 0.0
             gid = self._create_new_id(profile)
             logger.debug("  Track L%d → NEW global G%d (insufficient gallery: %d/%d)",
                          profile.local_track_id, gid,
@@ -563,11 +739,13 @@ class GlobalIdentityManager:
 
         with self._lock:
             if not self._gallery:
+                if self.config.supervised_mode:
+                    return -1, 0.0
                 gid = self._create_new_id_locked(profile)
                 return gid, 0.0
 
-            if self._matrix_dirty:
-                self._rebuild_matrix()
+            if self._matrix_dirty or (self._emb_matrix is not None and self._emb_matrix.shape[1] != rep.shape[0]):
+                self._rebuild_matrix(target_dim=rep.shape[0])
 
             if self._emb_matrix is None:
                 gid = self._create_new_id_locked(profile)
@@ -645,6 +823,8 @@ class GlobalIdentityManager:
         feat = embedding.astype(np.float32)
         with self._lock:
             if not self._gallery:
+                if self.config.supervised_mode:
+                    return -1, 0.0
                 gid = self._next_id
                 self._gallery[gid] = [feat.copy()]
                 self._temporal[gid] = {}
@@ -653,10 +833,12 @@ class GlobalIdentityManager:
                 self._matrix_dirty = True
                 return gid, 0.0
 
-            if self._matrix_dirty:
-                self._rebuild_matrix()
+            if self._matrix_dirty or (self._emb_matrix is not None and self._emb_matrix.shape[1] != feat.shape[0]):
+                self._rebuild_matrix(target_dim=feat.shape[0])
 
             if self._emb_matrix is None:
+                if self.config.supervised_mode:
+                    return -1, 0.0
                 gid = self._next_id
                 self._gallery[gid] = [feat.copy()]
                 self._temporal[gid] = {}
@@ -673,6 +855,8 @@ class GlobalIdentityManager:
             if best_sim >= self.config.similarity_threshold:
                 return best_gid, best_sim
             else:
+                if self.config.supervised_mode:
+                    return -1, 0.0
                 gid = self._next_id
                 self._gallery[gid] = [feat.copy()]
                 self._temporal[gid] = {}
@@ -818,17 +1002,17 @@ class GlobalIdentityManager:
 
     # ── Matrix helpers ────────────────────────────────────────────
 
-    def _rebuild_matrix(self) -> None:
+    def _rebuild_matrix(self, target_dim: Optional[int] = None) -> None:
         """
         Flatten _gallery into a [N, dim] matrix and parallel gid list.
         Called lazily when _matrix_dirty is True (inside lock).
         """
-        # Determine the target dimension, prioritizing newly added/dirty embeddings
-        target_dim = None
-        for embs in self._dirty.values():
-            if embs:
-                target_dim = embs[-1].shape[0]
-                break
+        if target_dim is None:
+            # Determine the target dimension, prioritizing newly added/dirty embeddings
+            for embs in self._dirty.values():
+                if embs:
+                    target_dim = embs[-1].shape[0]
+                    break
                 
         if target_dim is None:
             # Fallback to the most frequent dimension
@@ -843,6 +1027,9 @@ class GlobalIdentityManager:
         gids: List[int] = []
         
         for gid in list(self._gallery.keys()):
+            if self.config.supervised_mode and not self._names.get(gid):
+                continue
+
             embs = self._gallery[gid]
             valid_embs = [e for e in embs if target_dim is None or e.shape[0] == target_dim]
             
@@ -936,6 +1123,7 @@ class GlobalIdentityManager:
                         embs = [np.array(raw, dtype=np.float32)]
                     self._gallery[gid] = embs
                     self._temporal[gid] = {}
+                    self._names[gid] = r.name
                     if gid > max_id:
                         max_id = gid
 
@@ -952,6 +1140,7 @@ class GlobalIdentityManager:
             self._gallery.clear()
             self._temporal.clear()
             self._dirty.clear()
+            self._names.clear()
             self._next_id = 1
             self._emb_matrix = None
             self._emb_gids = []
@@ -1030,6 +1219,7 @@ class PersonDetectorTracker:
             iou=0.45,
             device=self.device,
             verbose=False,
+            half=(self.device == "cuda"),
         )
         if results[0].boxes is None or results[0].boxes.id is None:
             return None
@@ -1084,7 +1274,7 @@ class MultiVideoTrackingEngine:
         self.device = self.detector.device
 
         if extractor is None:
-            extractor = ReIDFeatureExtractor(device=self.device)
+            extractor = _build_reid_extractor(config, device=self.device)
         self.extractor = extractor
 
         self.identity_mgr = GlobalIdentityManager(config)
@@ -1123,12 +1313,20 @@ class MultiVideoTrackingEngine:
     ) -> None:
         """
         Draw bounding box + dual-label overlay showing both local and global ID.
-        Label format: "L{local} / G{global}"
+        Label format: "L{local} / G{global}" or Name if supervised.
         """
-        color = self._color(global_id)
+        color = self._color(global_id) if global_id != -1 else (0, 0, 255) # Red for unknown
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-        label = f" L{local_id} / G{global_id} "
+        if global_id == -1:
+            label = " Unknown "
+        else:
+            name = self.identity_mgr._names.get(global_id)
+            if name:
+                label = f" {name} "
+            else:
+                label = f" L{local_id} / G{global_id} "
+
         (lw, lh), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         ly_top = max(y1 - lh - baseline - 6, 0)
         cv2.rectangle(frame, (x1, ly_top), (x1 + lw, y1), color, -1)
@@ -1348,10 +1546,20 @@ class MultiVideoTrackingEngine:
             raise RuntimeError(f"Cannot open video: {video_path}")
 
         fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        orig_width   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_height  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        logger.info("  %d frames | %.1f FPS | %d×%d px", total_frames, fps, width, height)
+        
+        max_w = 1280
+        if orig_width > max_w:
+            scale = max_w / orig_width
+            width = max_w
+            height = int(orig_height * scale)
+        else:
+            width = orig_width
+            height = orig_height
+
+        logger.info("  %d frames | %.1f FPS | %d×%d px (orig: %d×%d)", total_frames, fps, width, height, orig_width, orig_height)
 
         # ── Output Writer ─────────────────────────────────────────
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -1377,6 +1585,9 @@ class MultiVideoTrackingEngine:
                 ret, frame = cap.read()
                 if not ret:
                     break
+                    
+                if orig_width > max_w:
+                    frame = cv2.resize(frame, (width, height))
 
                 if frame_number % frame_skip != 0:
                     writer.write(frame)

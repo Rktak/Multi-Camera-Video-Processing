@@ -178,6 +178,36 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### ⚙️ Re-ID Settings")
 
+    # ReID model selector
+    _REID_OPTIONS = {
+        "OSNet-AIN (recommended)": "osnet_ain",
+        "OSNet":                   "osnet",
+        "MobileNetV3 (legacy)":    "mobilenetv3",
+    }
+    reid_model_label = st.selectbox(
+        "Re-ID Backbone Model",
+        options=list(_REID_OPTIONS.keys()),
+        index=0,
+        help=(
+            "The neural network used to extract appearance embeddings for Re-ID.\n\n"
+            "• **OSNet-AIN** — Purpose-built for person Re-ID with Instance Norm "
+            "for cross-camera robustness. 512-dim, ~8 MB. (Recommended)\n"
+            "• **OSNet** — Same architecture without Instance Norm, slightly faster.\n"
+            "• **MobileNetV3** — General-purpose ImageNet features (576-dim). "
+            "Legacy fallback."
+        ),
+    )
+    reid_model_key = _REID_OPTIONS[reid_model_label]
+
+    st.markdown("---")
+    st.markdown("### 🔍 Matching & Filtering")
+
+    supervised_mode = st.toggle(
+        "Supervised Mode (Taught Persons Only)",
+        value=True,
+        help="If enabled, only people explicitly taught via the 'Teach Person' tab will be labeled. All others will be labeled as 'Unknown'."
+    )
+
     similarity_threshold = st.slider(
         "Cosine Similarity Threshold",
         min_value=0.50, max_value=0.99, value=0.70, step=0.01,
@@ -271,7 +301,15 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 📖 Pipeline (v2)")
-    st.markdown("""
+
+    # Dynamic model label for the pipeline display
+    _emb_label = {
+        "osnet_ain":    "OSNet-AIN Embeddings (512-d)",
+        "osnet":        "OSNet Embeddings (512-d)",
+        "mobilenetv3":  "MobileNetV3 Embeddings (576-d)",
+    }.get(reid_model_key, "Re-ID Embeddings")
+
+    st.markdown(f"""
     <div style='line-height:2.2'>
     <span class='pipeline-step'>📹 Video Upload</span><br>
     <span class='pipeline-arrow'>↓</span><br>
@@ -281,7 +319,7 @@ with st.sidebar:
     <span class='pipeline-arrow'>↓</span><br>
     <span class='pipeline-step'>🖼️ Gallery Accumulation</span><br>
     <span class='pipeline-arrow'>↓</span><br>
-    <span class='pipeline-step'>🧬 MobileNetV3 Embeddings</span><br>
+    <span class='pipeline-step'>🧬 {_emb_label}</span><br>
     <span class='pipeline-arrow'>↓</span><br>
     <span class='pipeline-step'>🔗 Track-Level Re-ID</span><br>
     <span class='pipeline-arrow'>↓</span><br>
@@ -306,12 +344,47 @@ st.markdown("---")
 # ─────────────────────────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────────────────────────
-tab_upload, tab_results, tab_dashboard = st.tabs([
+tab_teach, tab_upload, tab_results, tab_dashboard = st.tabs([
+    "🎓 Teach Person",
     "📤 Upload & Process",
     "🎬 Results",
     "📊 Tracking Dashboard",
 ])
 
+
+# ═══════════════════════════════════════════════════════════════════
+# TAB 0 — TEACH PERSON
+# ═══════════════════════════════════════════════════════════════════
+with tab_teach:
+    st.markdown("### 🎓 Teach the System a New Identity")
+    st.markdown(
+        "Upload a short video containing **only one person** (or mostly one person) "
+        "and provide their name. The system will learn to recognize them."
+    )
+    
+    with st.form("teach_form"):
+        teach_name = st.text_input("Person Name", placeholder="e.g., John Doe")
+        teach_video = st.file_uploader("Upload Video", type=["mp4", "avi", "mov"], key="teach_video")
+        
+        submitted = st.form_submit_button("Teach Identity", type="primary")
+        
+        if submitted:
+            if not teach_name or not teach_video:
+                st.error("Please provide both a name and a video.")
+            else:
+                with st.spinner(f"Teaching system to recognize {teach_name}..."):
+                    files = {"file": (teach_video.name, teach_video.getvalue(), teach_video.type)}
+                    data = {"person_name": teach_name}
+                    try:
+                        resp = requests.post(f"{api_url}/teach-person/", data=data, files=files)
+                        resp.raise_for_status()
+                        result = resp.json()
+                        if result.get("status") == "success":
+                            st.success(result["message"])
+                        else:
+                            st.error(result.get("message", "Unknown error"))
+                    except Exception as e:
+                        st.error(f"Error teaching identity: {e}")
 
 # ═══════════════════════════════════════════════════════════════════
 # TAB 1 — UPLOAD & PROCESS
@@ -402,6 +475,8 @@ with tab_upload:
                     "weight_temporal":      weight_temporal,
                     "weight_transition":    weight_transition,
                     "min_crop_quality":     min_crop_quality,
+                    "reid_model":           reid_model_key,
+                    "supervised_mode":      str(supervised_mode).lower(),
                 }
                 if topology_parsed:
                     params["camera_topology"] = json.dumps(topology_parsed)

@@ -90,10 +90,12 @@ async def lifespan(app_instance):
 
     # Build default config from environment (overridden per-job via API params)
     yolo_model = os.getenv("YOLO_MODEL", "yolov8n.pt")
+    reid_model = os.getenv("REID_MODEL", "osnet_ain")
     default_config = TrackingConfig(
         similarity_threshold=0.70,
         device="auto",
         yolo_model=yolo_model,
+        reid_model=reid_model,
     )
     tracker = MultiVideoTracker(config=default_config)
 
@@ -151,21 +153,105 @@ def root() -> dict:
         "docs": "http://localhost:8000/docs",
     }
 
+from fastapi import Form, BackgroundTasks, Depends
+from database import get_db, PersonTrack, PersonIdentity
+from sqlalchemy import func
+
+@app.post("/teach-person/", tags=["Processing"], summary="Teach a new person identity")
+async def teach_person(
+    person_name: str = Form(..., description="Name of the person"),
+    file: UploadFile = File(..., description="Video of the person"),
+    db = Depends(get_db)
+) -> dict:
+    """
+    Teach the system a specific person. The person who appears the longest
+    in the video will be registered with the given name.
+    """
+    ext = os.path.splitext(file.filename)[-1].lower()
+    if ext not in {".mp4", ".avi", ".mov", ".mkv"}:
+        raise HTTPException(status_code=415, detail="Unsupported file type")
+
+    # Save file
+    teach_dir = os.path.join(UPLOAD_DIR, "teaching")
+    os.makedirs(teach_dir, exist_ok=True)
+    safe_name = f"teach_{int(datetime.utcnow().timestamp())}_{file.filename.replace(' ', '_')}"
+    dest_path = os.path.join(teach_dir, safe_name)
+    
+    content = await file.read()
+    with open(dest_path, "wb") as f_out:
+        f_out.write(content)
+
+    print(f"[Teach] Processing {dest_path} for person: {person_name}")
+
+    # Build a tracker that will NOT merge (threshold=1.0)
+    yolo_model = os.getenv("YOLO_MODEL", "yolov8n.pt")
+    reid_model = os.getenv("REID_MODEL", "osnet_ain")
+    teach_config = TrackingConfig(
+        similarity_threshold=1.0,  # Never merge
+        supervised_mode=False,     # Allow creating new IDs
+        device="auto",
+        yolo_model=yolo_model,
+        reid_model=reid_model,
+    )
+    
+    from tracker import MultiVideoTrackingEngine
+    engine = MultiVideoTrackingEngine(teach_config)
+    engine.load_cache_from_db(db)
+    
+    def dummy_callback(frames, total): pass
+    
+    # Process the video
+    dummy_output = os.path.join(teach_dir, f"out_{safe_name}")
+    engine.track_video(dest_path, dummy_output, db, 50, 1, dummy_callback)
+
+    # Find the most prominent person in this video
+    top_person = (
+        db.query(PersonTrack.global_person_id, func.count(PersonTrack.id).label('ct'))
+        .filter(PersonTrack.video_source == safe_name)
+        .group_by(PersonTrack.global_person_id)
+        .order_by(func.count(PersonTrack.id).desc())
+        .first()
+    )
+
+    if not top_person:
+        return {"status": "error", "message": "No person detected in the video."}
+
+    gid = top_person.global_person_id
+    
+    # Assign the name
+    identity = db.query(PersonIdentity).filter(PersonIdentity.global_person_id == gid).first()
+    if identity:
+        identity.name = person_name
+        db.commit()
+        
+    # Reload global tracker cache so it knows about the new name
+    global tracker
+    with tracker.identity_mgr._lock:
+        tracker.identity_mgr._names[gid] = person_name
+
+    return {
+        "status": "success", 
+        "message": f"Successfully registered '{person_name}' (Global ID: {gid})",
+        "global_id": gid
+    }
+
 
 @app.post("/upload-videos/", tags=["Processing"], summary="Upload and process videos")
 async def upload_videos(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(..., description="One or more video files (.mp4, .avi, .mov)"),
-    # ── Existing parameters ────────────────────────────────────────
+    # ── Existing parameters ────────────────────────────────────────────
     similarity_threshold: float = 0.70,
     frame_skip: int = 1,
-    # ── New v2 parameters ──────────────────────────────────────────
+    # ── New v2 parameters ──────────────────────────────────────────────
     gallery_size: int = 8,
     weight_appearance: float = 0.70,
     weight_temporal: float = 0.20,
     weight_transition: float = 0.10,
     camera_topology: Optional[str] = None,
     min_crop_quality: float = 0.40,
+    reid_model: str = "osnet_ain",
+    supervised_mode: bool = False,
 ) -> dict:
     """
     Accept multiple video uploads and start asynchronous processing.
@@ -184,6 +270,7 @@ async def upload_videos(
         camera_topology:      [NEW v2] JSON string describing camera travel times.
                               Example: '{"cam1": {"cam2": [2, 10]}}'
         min_crop_quality:     [NEW v2] Minimum YOLO confidence for gallery crops (default 0.40).
+        supervised_mode:      If True, only taught identities are tracked. Others are Unknown.
 
     Returns:
         job_id and polling URL.
@@ -240,6 +327,8 @@ async def upload_videos(
         frame_skip=frame_skip,
         device="auto",
         yolo_model=os.getenv("YOLO_MODEL", "yolov8n.pt"),
+        reid_model=reid_model,
+        supervised_mode=supervised_mode,
     )
 
     # Register job state
@@ -267,6 +356,7 @@ async def upload_videos(
             "weight_transition":    round(job_config.weight_transition, 3),
             "min_crop_quality":     min_crop_quality,
             "camera_topology":      topology_dict,
+            "reid_model":           reid_model,
         },
     }
 

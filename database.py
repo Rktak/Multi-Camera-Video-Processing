@@ -159,12 +159,14 @@ class PersonIdentity(Base):
     __tablename__ = "person_identities"
 
     global_person_id = Column(Integer, primary_key=True, index=True)
+    # The name of the taught person. Null if unsupervised.
+    name = Column(String(100), nullable=True)
     # v2: stores List[List[float]] — a gallery of up to gallery_size embeddings
     embedding = Column(JSON, nullable=False)
     last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     def __repr__(self) -> str:
-        return f"<PersonIdentity global_id={self.global_person_id}>"
+        return f"<PersonIdentity global_id={self.global_person_id} name={self.name}>"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -178,6 +180,7 @@ _V2_MIGRATIONS = [
     "ALTER TABLE person_tracks ADD COLUMN IF NOT EXISTS track_end_frame INTEGER;",
     "ALTER TABLE person_tracks ADD COLUMN IF NOT EXISTS quality_score FLOAT;",
     "ALTER TABLE person_tracks ADD COLUMN IF NOT EXISTS match_score FLOAT;",
+    "ALTER TABLE person_identities ADD COLUMN IF NOT EXISTS name VARCHAR(100);",
 ]
 
 

@@ -74,11 +74,17 @@ Browser will open automatically at: http://localhost:8501
 
 ## 🚀 Usage
 
+### Option A: Unsupervised Mode
 1. Upload **2 or more** `.mp4` / `.avi` / `.mov` video files in the **📤 Upload & Process** tab
-2. Adjust settings in the sidebar (see [Tuning Parameters](#-key-tuning-parameters) below)
-3. Click **🚀 Process Videos** and watch per-video progress bars
-4. Switch to the **🎬 Results** tab to see annotated videos side-by-side
-   - Overlay format: **`L{local} / G{global}`** — local ByteTrack ID + global Re-ID person ID
+2. Ensure **Supervised Mode** is turned OFF in the left sidebar
+3. Click **🚀 Process Videos**. The system will automatically cluster people across cameras and assign them unique Global IDs.
+
+### Option B: Supervised "Teach" Mode
+1. Go to the **🎓 Teach Person** tab and upload a short video of one person. Enter their name (e.g., "John Doe") and click Teach.
+2. Go to the **📤 Upload & Process** tab, and ensure **Supervised Mode** is turned ON in the sidebar.
+3. Upload your multi-camera videos and click Process. Only "taught" individuals will be named in the output; everyone else will be labeled as "Unknown" with a red bounding box!
+
+4. Check the **🎬 Results** tab to see annotated videos side-by-side
 5. Check the **📊 Tracking Dashboard** tab to browse the PostgreSQL tracking log and live diagnostics
 
 ---
@@ -112,7 +118,7 @@ Annotated Video + PostgreSQL DB (with track metadata)
 All tunable parameters in one place. Weights are auto-normalised to sum to 1.0.
 
 ### `ReIDFeatureExtractor` — Pluggable Model
-MobileNetV3-Small (576-dim) is the default. To swap in a stronger model (OSNet, ResNet-IBN, CLIP): subclass `ReIDFeatureExtractor`, override `_forward_batch()`, pass to `MultiVideoTrackingEngine`. No other changes needed.
+OSNet-AIN (512-dim) is the default for high robustness to camera changes, but it also supports MobileNetV3. To swap in a stronger model (ResNet-IBN, CLIP): subclass `ReIDFeatureExtractor`, override `_forward_batch()`, pass to `MultiVideoTrackingEngine`. No other changes needed.
 
 ### `LocalTrackProfile` — Per-Track Gallery
 - Stores up to `gallery_size` (default 8) high-quality crops per ByteTrack local ID
@@ -134,7 +140,9 @@ final_score = w_appearance  × gallery-to-gallery cosine sim
 
 ### Detection: YOLOv8n
 - Detects only `person` class (COCO class 0), conf ≥ 0.35, NMS IoU 0.45
-- YOLO pool: 2 instances pre-loaded at startup to avoid weight reload overhead
+- **Performance**: Automatically downscales high-res videos to 1280px width to massively speed up detection.
+- **Performance**: Automatically uses FP16 half-precision (`half=True`) if a CUDA GPU is available, doubling inference speed.
+- YOLO pool: pre-loaded at startup to avoid weight reload overhead.
 
 ### Database: PostgreSQL via SQLAlchemy
 - Two tables: `person_tracks` (one row per detection) + `person_identities` (gallery persistence)
@@ -169,7 +177,8 @@ CREATE TABLE person_tracks (
 ```sql
 CREATE TABLE person_identities (
     global_person_id  INTEGER PRIMARY KEY,
-    embedding         JSON NOT NULL,        -- gallery: [[576 floats], ...]
+    name              VARCHAR(100),         -- explicit name from Supervised mode
+    embedding         JSON NOT NULL,        -- gallery: [[512 floats], ...]
     last_updated      TIMESTAMP
 );
 ```
