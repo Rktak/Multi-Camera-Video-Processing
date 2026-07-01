@@ -1068,6 +1068,9 @@ class GlobalIdentityManager:
         Write dirty global identity galleries to the PersonIdentity table.
         Safe to call concurrently — snapshots dirty dict under lock.
         """
+        if self.config.supervised_mode:
+            return
+
         from database import PersonIdentity
 
         with self._lock:
