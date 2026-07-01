@@ -173,9 +173,11 @@ class TrackingConfig:
     frame_skip: int = 1
     device: str = "auto"
     yolo_model: str = "yolov8n.pt"
+    yolo_imgsz: int = 480           # YOLO input resolution (640=default, 480/320=faster)
     yolo_pool_size: int = 2
     db_batch_size: int = 50
     min_gallery_for_match: int = 2
+    reid_half: bool = True           # Use FP16 for ReID model on CUDA (faster)
     reid_model: str = "osnet_ain"          # "osnet_ain" | "osnet" | "mobilenetv3"
     reid_weights_path: Optional[str] = None  # Custom .pth path (auto-download if None)
     supervised_mode: bool = False            # If True, only match against taught named identities
@@ -210,8 +212,9 @@ class ReIDFeatureExtractor:
 
     EMB_DIM = 576  # MobileNetV3-Small avgpool output dimension
 
-    def __init__(self, device: str = "cpu") -> None:
+    def __init__(self, device: str = "cpu", use_half: bool = False) -> None:
         self.device = device
+        self.use_half = use_half and (device == "cuda")
 
         # Load MobileNetV3-Small (backbone only — no classifier)
         mobilenet = models.mobilenet_v3_small(
@@ -222,9 +225,11 @@ class ReIDFeatureExtractor:
             mobilenet.avgpool,
             torch.nn.Flatten(),  # → [batch, 576]
         ).to(self.device)
+        if self.use_half:
+            self.model.half()
         self.model.eval()
-        logger.info("MobileNetV3-Small Re-ID extractor loaded (%d-dim) on %s.",
-                    self.EMB_DIM, self.device.upper())
+        logger.info("MobileNetV3-Small Re-ID extractor loaded (%d-dim) on %s [FP%s].",
+                    self.EMB_DIM, self.device.upper(), "16" if self.use_half else "32")
 
         # ImageNet normalisation constants
         self._mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -245,8 +250,11 @@ class ReIDFeatureExtractor:
     def _forward_batch(self, chw_arrays: List[np.ndarray]) -> np.ndarray:
         """Run a list of CHW float32 arrays through the model. Returns [N, EMB_DIM]."""
         batch = torch.from_numpy(np.stack(chw_arrays)).to(self.device)
+        if self.use_half:
+            batch = batch.half()
         with torch.no_grad():
-            return self.model(batch).cpu().numpy()
+            out = self.model(batch)
+        return out.float().cpu().numpy()
 
     def extract_batch(
         self, crops: List[Optional[np.ndarray]]
@@ -326,8 +334,10 @@ class OSNetReIDExtractor:
         device: str = "cpu",
         model_name: str = "osnet_ain",
         weights_path: Optional[str] = None,
+        use_half: bool = False,
     ) -> None:
         self.device = device
+        self.use_half = use_half and (device == "cuda")
         self._torchreid_name = self._MODEL_MAP.get(model_name, model_name)
 
         try:
@@ -352,9 +362,12 @@ class OSNetReIDExtractor:
             fe_kwargs["model_path"] = weights_path
 
         self._fe = TorchreidFE(**fe_kwargs)
+        if self.use_half:
+            self._fe.model.half()
         logger.info(
-            "OSNet Re-ID extractor loaded: %s (%d-dim) on %s.",
+            "OSNet Re-ID extractor loaded: %s (%d-dim) on %s [FP%s].",
             self._torchreid_name, self.EMB_DIM, device.upper(),
+            "16" if self.use_half else "32",
         )
 
         # ImageNet normalisation constants (same as torchreid uses internally)
@@ -377,9 +390,11 @@ class OSNetReIDExtractor:
     def _forward_batch(self, chw_arrays: List[np.ndarray]) -> np.ndarray:
         """Run a list of CHW float32 arrays through OSNet. Returns [N, 512]."""
         batch = torch.from_numpy(np.stack(chw_arrays)).to(self.device)
+        if self.use_half:
+            batch = batch.half()
         with torch.no_grad():
             features = self._fe.model(batch)
-        return features.cpu().numpy()
+        return features.float().cpu().numpy()
 
     def extract_batch(
         self, crops: List[Optional[np.ndarray]]
@@ -435,6 +450,7 @@ def _build_reid_extractor(
     Falls back to MobileNetV3 if torchreid is not installed.
     """
     model_key = config.reid_model.lower().strip()
+    use_half = config.reid_half
 
     if model_key in ("osnet_ain", "osnet", "osnet_ain_x1_0", "osnet_x1_0"):
         try:
@@ -442,23 +458,24 @@ def _build_reid_extractor(
                 device=device,
                 model_name=model_key,
                 weights_path=config.reid_weights_path,
+                use_half=use_half,
             )
         except ImportError:
             logger.warning(
                 "torchreid not installed — falling back to MobileNetV3. "
                 "Install with: pip install torchreid"
             )
-            return ReIDFeatureExtractor(device=device)
+            return ReIDFeatureExtractor(device=device, use_half=use_half)
     elif model_key == "mobilenetv3":
-        return ReIDFeatureExtractor(device=device)
+        return ReIDFeatureExtractor(device=device, use_half=use_half)
     else:
         logger.warning(
             "Unknown reid_model '%s' — falling back to OSNet-AIN.", model_key
         )
         try:
-            return OSNetReIDExtractor(device=device, model_name="osnet_ain")
+            return OSNetReIDExtractor(device=device, model_name="osnet_ain", use_half=use_half)
         except ImportError:
-            return ReIDFeatureExtractor(device=device)
+            return ReIDFeatureExtractor(device=device, use_half=use_half)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -519,6 +536,41 @@ class LocalTrackProfile:
         self._rep_emb: Optional[np.ndarray] = None
 
     # ── Public API ────────────────────────────────────────────────
+
+    def needs_embedding(
+        self,
+        bbox: Tuple[int, int, int, int],
+        confidence: float,
+    ) -> bool:
+        """
+        Lightweight pre-check: does the gallery need a new embedding on
+        this frame?  Call BEFORE running the expensive ReID forward pass
+        so we can skip GPU inference for crops that would be discarded.
+
+        Returns True if:
+            • Gallery is not full yet
+            • Enough frames have elapsed since the last gallery sample
+            • The crop passes the minimum size and confidence filters
+        """
+        # Gallery already full — no more embeddings needed
+        if len(self.gallery) >= self.config.gallery_size:
+            return False
+
+        # Too soon since last accepted sample
+        if (self._frames_since_sample + 1) < self.config.gallery_sample_every:
+            return False
+
+        # Minimum confidence
+        if confidence < self.config.min_crop_confidence:
+            return False
+
+        # Minimum crop size
+        x1, y1, x2, y2 = bbox
+        cw, ch = x2 - x1, y2 - y1
+        if cw < self.config.min_crop_width or ch < self.config.min_crop_height:
+            return False
+
+        return True
 
     def update(
         self,
@@ -1230,9 +1282,10 @@ class PersonDetectorTracker:
             classes=[0],    # COCO class 0 = "person"
             conf=0.35,
             iou=0.45,
+            imgsz=self.config.yolo_imgsz,  # Smaller = faster (default 480 vs 640)
             device=self.device,
             verbose=False,
-            half=(self.device == "cuda"),
+            half=(self.device == "cuda"),   # FP16 on GPU — critical for speed
         )
         if results[0].boxes is None or results[0].boxes.id is None:
             return None
@@ -1369,6 +1422,11 @@ class MultiVideoTrackingEngine:
         """
         Run detection + embedding extraction + preliminary Re-ID for one frame.
 
+        Smart ReID skipping: only extract embeddings for crops whose
+        LocalTrackProfile.needs_embedding() returns True. This avoids
+        expensive GPU inference for crops that would be discarded by
+        the gallery gating logic anyway (~50-80% savings).
+
         Returns:
             annotated_frame: Frame with bounding boxes drawn.
             pending_records: List of dicts ready for DB insertion.
@@ -1392,24 +1450,48 @@ class MultiVideoTrackingEngine:
         all_conf = boxes.conf.cpu().numpy().astype(np.float32)
         all_ids  = boxes.id.cpu().numpy().astype(np.int32)
 
-        # Clamp boxes
+        # Clamp boxes and determine which crops actually need ReID
         clamped: List[Tuple[int, int, int, int]] = []
         crops:   List[Optional[np.ndarray]] = []
+        need_reid: List[bool] = []  # Per-detection: does gallery need embedding?
+
         for i in range(n):
             x1, y1, x2, y2 = all_xyxy[i].astype(int)
             x1 = max(0, min(x1, w - 1))
             y1 = max(0, min(y1, h - 1))
             x2 = max(x1 + 1, min(x2, w))
             y2 = max(y1 + 1, min(y2, h))
-            clamped.append((x1, y1, x2, y2))
+            bbox = (x1, y1, x2, y2)
+            clamped.append(bbox)
+
+            local_id = int(all_ids[i])
+            conf = float(all_conf[i])
+
             if x2 > x1 and y2 > y1:
-                crops.append(frame[y1:y2, x1:x2])
+                crop = frame[y1:y2, x1:x2]
+                crops.append(crop)
             else:
                 crops.append(None)
+                need_reid.append(False)
+                continue
 
-        # One batch GPU inference for all crops
+            # Smart skip: check if this track's gallery needs a new embedding,
+            # OR if we haven't seen this track before (need initial quick_match)
+            profile = local_profiles.get(local_id)
+            if profile is None:
+                # New track — need embedding for initial quick_match
+                need_reid.append(True)
+            elif local_id not in local_to_global:
+                # Known track but no global ID assigned yet — need quick_match
+                need_reid.append(True)
+            else:
+                # Existing track — only extract if gallery needs it
+                need_reid.append(profile.needs_embedding(bbox, conf))
+
+        # Batch GPU inference ONLY for crops that need ReID
         t_reid_start = time.time()
-        embeddings = self.extractor.extract_batch(crops)
+        reid_crops = [crops[i] if need_reid[i] else None for i in range(n)]
+        embeddings = self.extractor.extract_batch(reid_crops)
         t_reid = time.time() - t_reid_start
 
         pending_records: List[dict] = []
@@ -1597,6 +1679,28 @@ class MultiVideoTrackingEngine:
         # Borrow a YOLO instance from the pool for this job
         logger.info("  Borrowing YOLO model instance from the pool...")
         yolo_inst = self.detector.borrow_yolo()
+
+        # ── CUDA Warmup ───────────────────────────────────────────
+        # First YOLO+ReID inference triggers CUDA kernel JIT compilation
+        # which can take 30-180s. Run a dummy pass to pay this cost
+        # upfront rather than penalising real frames.
+        if self.device == "cuda":
+            logger.info("  Running CUDA warmup pass (first inference compiles kernels)...")
+            t_warmup = time.time()
+            dummy = np.zeros((height, width, 3), dtype=np.uint8)
+            # Warmup YOLO (triggers cuDNN autotuner + kernel compilation)
+            _ = yolo_inst.track(
+                dummy, persist=False, classes=[0], conf=0.35,
+                imgsz=self.config.yolo_imgsz, device=self.device,
+                verbose=False, half=True,
+            )
+            # Warmup ReID (triggers kernel compilation for the batch size)
+            dummy_crop = np.zeros((128, 64, 3), dtype=np.uint8)
+            _ = self.extractor.extract_batch([dummy_crop])
+            # Reset YOLO tracker state so warmup detection doesn't interfere
+            yolo_inst.predictor = None
+            logger.info("  CUDA warmup completed in %.1fs", time.time() - t_warmup)
+
         logger.info("  YOLO model borrowed successfully. Starting processing loop...")
 
         # Per-video local track profiles (local_id → LocalTrackProfile)
@@ -1607,6 +1711,8 @@ class MultiVideoTrackingEngine:
 
         # ── Phase 1: Frame Loop ───────────────────────────────────
         frame_number    = 0
+        last_frame_had_detection = False
+        last_annotated_frame = None
         pending_records: List[dict] = []
         unique_local_ids: set = set()
         tick_times: List[float] = []
@@ -1637,9 +1743,10 @@ class MultiVideoTrackingEngine:
                 resize_times.append(time.time() - t_resize_start)
 
                 if frame_number % frame_skip != 0:
-                    t_write_start = time.time()
-                    writer.write(frame)
-                    write_times.append(time.time() - t_write_start)
+                    if last_frame_had_detection and last_annotated_frame is not None:
+                        t_write_start = time.time()
+                        writer.write(last_annotated_frame)
+                        write_times.append(time.time() - t_write_start)
                     
                     frame_number += 1
                     tick_times.append(time.time() - t_tick_start)
@@ -1656,9 +1763,15 @@ class MultiVideoTrackingEngine:
                 yolo_times.append(t_yolo)
                 reid_times.append(t_reid)
                 
-                t_write_start = time.time()
-                writer.write(annotated)
-                write_times.append(time.time() - t_write_start)
+                last_frame_had_detection = len(records) > 0
+                
+                if last_frame_had_detection:
+                    last_annotated_frame = annotated
+                    t_write_start = time.time()
+                    writer.write(annotated)
+                    write_times.append(time.time() - t_write_start)
+                else:
+                    last_annotated_frame = None
 
                 pending_records.extend(records)
                 unique_local_ids.update(r["local_track_id"] for r in records)

@@ -91,11 +91,15 @@ async def lifespan(app_instance):
     # Build default config from environment (overridden per-job via API params)
     yolo_model = os.getenv("YOLO_MODEL", "yolov8n.pt")
     reid_model = os.getenv("REID_MODEL", "osnet_ain")
+    yolo_imgsz = int(os.getenv("YOLO_IMGSZ", "480"))
+    reid_half = os.getenv("REID_HALF", "true").lower() in ("true", "1", "yes")
     default_config = TrackingConfig(
         similarity_threshold=0.70,
         device="auto",
         yolo_model=yolo_model,
+        yolo_imgsz=yolo_imgsz,
         reid_model=reid_model,
+        reid_half=reid_half,
     )
     tracker = MultiVideoTracker(config=default_config)
 
@@ -327,7 +331,9 @@ async def upload_videos(
         frame_skip=frame_skip,
         device="auto",
         yolo_model=os.getenv("YOLO_MODEL", "yolov8n.pt"),
+        yolo_imgsz=int(os.getenv("YOLO_IMGSZ", "480")),
         reid_model=reid_model,
+        reid_half=os.getenv("REID_HALF", "true").lower() in ("true", "1", "yes"),
         supervised_mode=supervised_mode,
     )
 
