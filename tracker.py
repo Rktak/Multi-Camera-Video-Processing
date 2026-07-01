@@ -80,9 +80,19 @@ from database import PersonTrack, SessionLocal
 # ─────────────────────────────────────────────────────────────────
 logger = logging.getLogger("mcmot.tracker")
 if not logger.handlers:
+    # Console Handler
     _h = logging.StreamHandler()
     _h.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
     logger.addHandler(_h)
+    
+    # File Handler
+    try:
+        _fh = logging.FileHandler("mcmot_tracker.log", mode="a", encoding="utf-8")
+        _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s"))
+        logger.addHandler(_fh)
+    except Exception as e:
+        print(f"Failed to setup file logging: {e}")
+        
 logger.setLevel(logging.INFO)
 
 
@@ -1355,18 +1365,22 @@ class MultiVideoTrackingEngine:
         yolo_inst: YOLO,
         local_profiles: Dict[int, LocalTrackProfile],
         local_to_global: Dict[int, int],
-    ) -> Tuple[np.ndarray, List[dict]]:
+    ) -> Tuple[np.ndarray, List[dict], float, float]:
         """
         Run detection + embedding extraction + preliminary Re-ID for one frame.
 
         Returns:
             annotated_frame: Frame with bounding boxes drawn.
-            pending_records: List of dicts ready for DB insertion
-                             (global_person_id filled with quick_match result).
+            pending_records: List of dicts ready for DB insertion.
+            yolo_time: Time taken for YOLO detection and tracking.
+            reid_time: Time taken for Re-ID batch embedding extraction.
         """
+        t_yolo_start = time.time()
         result = self.detector.detect_and_track(frame, yolo_inst)
+        t_yolo = time.time() - t_yolo_start
+
         if result is None:
-            return frame, []
+            return frame, [], t_yolo, 0.0
 
         annotated = frame.copy()
         h, w = frame.shape[:2]
@@ -1394,7 +1408,9 @@ class MultiVideoTrackingEngine:
                 crops.append(None)
 
         # One batch GPU inference for all crops
+        t_reid_start = time.time()
         embeddings = self.extractor.extract_batch(crops)
+        t_reid = time.time() - t_reid_start
 
         pending_records: List[dict] = []
 
@@ -1442,7 +1458,7 @@ class MultiVideoTrackingEngine:
                 "match_score":       None,
             })
 
-        return annotated, pending_records
+        return annotated, pending_records, t_yolo, t_reid
 
     def _finalize_tracks(
         self,
@@ -1540,12 +1556,17 @@ class MultiVideoTrackingEngine:
             Summary dict with processing statistics.
         """
         video_source = os.path.basename(video_path)
-        logger.info("▶ Starting: %s", video_source)
+        logger.info("▶ Starting video tracking job for: %s", video_source)
+        logger.info("  Input path: %s", video_path)
+        logger.info("  Output path: %s", output_path)
+        logger.info("  Config - Supervised Mode: %s, Similarity Threshold: %.2f", self.config.supervised_mode, self.config.similarity_threshold)
         t_start = time.time()
 
         # ── Open Video ────────────────────────────────────────────
+        logger.info("  Opening video file...")
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
+            logger.error("  Failed to open video file: %s", video_path)
             raise RuntimeError(f"Cannot open video: {video_path}")
 
         fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -1558,19 +1579,25 @@ class MultiVideoTrackingEngine:
             scale = max_w / orig_width
             width = max_w
             height = int(orig_height * scale)
+            logger.info("  Video downscaling enabled: %d×%d -> %d×%d", orig_width, orig_height, width, height)
         else:
             width = orig_width
             height = orig_height
 
-        logger.info("  %d frames | %.1f FPS | %d×%d px (orig: %d×%d)", total_frames, fps, width, height, orig_width, orig_height)
+        logger.info("  Video specs: %d frames | %.1f FPS | %d×%d px", total_frames, fps, width, height)
 
         # ── Output Writer ─────────────────────────────────────────
+        logger.info("  Initializing video writer...")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         fourcc = cv2.VideoWriter_fourcc(*"avc1")
         writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        if not writer.isOpened():
+            logger.warning("  VideoWriter could not be opened. Annotated output will not be saved.")
 
         # Borrow a YOLO instance from the pool for this job
+        logger.info("  Borrowing YOLO model instance from the pool...")
         yolo_inst = self.detector.borrow_yolo()
+        logger.info("  YOLO model borrowed successfully. Starting processing loop...")
 
         # Per-video local track profiles (local_id → LocalTrackProfile)
         local_profiles: Dict[int, LocalTrackProfile] = {}
@@ -1582,35 +1609,68 @@ class MultiVideoTrackingEngine:
         frame_number    = 0
         pending_records: List[dict] = []
         unique_local_ids: set = set()
+        tick_times: List[float] = []
+        read_times: List[float] = []
+        resize_times: List[float] = []
+        proc_times: List[float] = []
+        yolo_times: List[float] = []
+        reid_times: List[float] = []
+        write_times: List[float] = []
+        db_times: List[float] = []
+
+        t_phase1_start = time.time()
 
         try:
             while True:
+                t_tick_start = time.time()
+                
+                t_read_start = time.time()
                 ret, frame = cap.read()
+                read_times.append(time.time() - t_read_start)
+                
                 if not ret:
                     break
                     
+                t_resize_start = time.time()
                 if orig_width > max_w:
                     frame = cv2.resize(frame, (width, height))
+                resize_times.append(time.time() - t_resize_start)
 
                 if frame_number % frame_skip != 0:
+                    t_write_start = time.time()
                     writer.write(frame)
+                    write_times.append(time.time() - t_write_start)
+                    
                     frame_number += 1
+                    tick_times.append(time.time() - t_tick_start)
+                    yolo_times.append(0.0)
+                    reid_times.append(0.0)
                     continue
 
-                annotated, records = self._process_frame(
+                t_proc_start = time.time()
+                annotated, records, t_yolo, t_reid = self._process_frame(
                     frame, video_source, frame_number,
                     yolo_inst, local_profiles, local_to_global,
                 )
+                proc_times.append(time.time() - t_proc_start)
+                yolo_times.append(t_yolo)
+                reid_times.append(t_reid)
+                
+                t_write_start = time.time()
                 writer.write(annotated)
+                write_times.append(time.time() - t_write_start)
 
                 pending_records.extend(records)
                 unique_local_ids.update(r["local_track_id"] for r in records)
 
+                t_db_start = time.time()
                 if len(pending_records) >= db_batch_size:
                     self._flush_pending(db_session, pending_records)
                     pending_records.clear()
+                db_times.append(time.time() - t_db_start)
 
                 frame_number += 1
+                tick_times.append(time.time() - t_tick_start)
 
                 if progress_callback is not None and frame_number % 10 == 0:
                     try:
@@ -1621,24 +1681,59 @@ class MultiVideoTrackingEngine:
                 if frame_number % 100 == 0:
                     pct = (frame_number / max(total_frames, 1)) * 100
                     elapsed = time.time() - t_start
-                    logger.info("  [%s] %d/%d (%.1f%%) | %.1fs",
-                                video_source, frame_number, total_frames, pct, elapsed)
+                    avg_tick = np.mean(tick_times[-100:]) if tick_times else 0.0
+                    avg_read = np.mean(read_times[-100:]) if read_times else 0.0
+                    avg_resize = np.mean(resize_times[-100:]) if resize_times else 0.0
+                    avg_proc = np.mean(proc_times[-100:]) if proc_times else 0.0
+                    avg_yolo = np.mean(yolo_times[-100:]) if yolo_times else 0.0
+                    avg_reid = np.mean(reid_times[-100:]) if reid_times else 0.0
+                    avg_write = np.mean(write_times[-100:]) if write_times else 0.0
+                    avg_db = np.mean(db_times[-100:]) if db_times else 0.0
+                    logger.info(
+                        "  [%s] %d/%d (%.1f%%) | elapsed: %.1fs | avg tick: %.4fs "
+                        "[read: %.4fs, resize: %.4fs, proc: %.4fs (yolo: %.4fs, reid: %.4fs), write: %.4fs, db: %.4fs]",
+                        video_source, frame_number, total_frames, pct, elapsed, avg_tick,
+                        avg_read, avg_resize, avg_proc, avg_yolo, avg_reid, avg_write, avg_db
+                    )
 
             # Flush remaining records BEFORE finalization
             if pending_records:
+                logger.info("  [%s] Flushing final %d pending frame-level records to DB...", video_source, len(pending_records))
                 self._flush_pending(db_session, pending_records)
                 pending_records.clear()
 
         finally:
+            logger.info("  [%s] Releasing video capture and writer resources...", video_source)
             cap.release()
             writer.release()
+            logger.info("  [%s] Returning YOLO instance to pool...", video_source)
             self.detector.return_yolo(yolo_inst)
 
+        t_phase1_end = time.time()
+        phase1_duration = t_phase1_end - t_phase1_start
+        logger.info(
+            "  [%s] Phase 1 (Frame Loop) completed in %.2fs (avg tick: %.4fs/frame)\n"
+            "        Breakdown - avg read: %.4fs | avg resize: %.4fs | avg proc: %.4fs (yolo: %.4fs, reid: %.4fs) | avg write: %.4fs | avg db: %.4fs", 
+            video_source, phase1_duration, np.mean(tick_times) if tick_times else 0.0,
+            np.mean(read_times) if read_times else 0.0,
+            np.mean(resize_times) if resize_times else 0.0,
+            np.mean(proc_times) if proc_times else 0.0,
+            np.mean(yolo_times) if yolo_times else 0.0,
+            np.mean(reid_times) if reid_times else 0.0,
+            np.mean(write_times) if write_times else 0.0,
+            np.mean(db_times) if db_times else 0.0
+        )
+
         # ── Phase 2: Track Finalization ───────────────────────────
-        logger.info("  [%s] Finalizing %d local tracks...", video_source, len(local_profiles))
+        t_phase2_start = time.time()
+        logger.info("  [%s] Finalizing %d local tracks (assigning global IDs)...", video_source, len(local_profiles))
         final_local_to_global = self._finalize_tracks(
             video_source, local_profiles, db_session
         )
+        t_phase2_end = time.time()
+        phase2_duration = t_phase2_end - t_phase2_start
+        logger.info("  [%s] Phase 2 (Track Finalization) completed in %.2fs", 
+                    video_source, phase2_duration)
 
         # Store profiles for diagnostics
         with self._profiles_lock:
@@ -1667,8 +1762,61 @@ class MultiVideoTrackingEngine:
             self._diagnostics[video_source] = diag
 
         elapsed_total = time.time() - t_start
-        logger.info("✓ Done: %s in %.1fs | Local tracks: %d | Global IDs: %s",
-                    video_source, elapsed_total, len(local_profiles), unique_global_ids)
+
+        # ── Performance Summary ───────────────────────────────────
+        total_read   = sum(read_times)
+        total_resize = sum(resize_times)
+        total_proc   = sum(proc_times)
+        total_yolo   = sum(yolo_times)
+        total_reid   = sum(reid_times)
+        total_write  = sum(write_times)
+        total_db     = sum(db_times)
+        total_finalize = phase2_duration
+        accounted    = total_read + total_resize + total_proc + total_write + total_db + total_finalize
+        overhead     = max(0.0, elapsed_total - accounted)
+
+        def _pct(val: float) -> str:
+            return f"{(val / elapsed_total * 100):.1f}%" if elapsed_total > 0 else "0.0%"
+
+        logger.info(
+            "═══════════════════════════════════════════════════════════\n"
+            "  [%s] PERFORMANCE SUMMARY\n"
+            "───────────────────────────────────────────────────────────\n"
+            "  Total time:         %.2fs\n"
+            "  Total frames:       %d  (processed: %d)\n"
+            "  Effective FPS:      %.1f frames/sec\n"
+            "───────────────────────────────────────────────────────────\n"
+            "  Phase 1 (Frame Loop):      %.2fs (%s)\n"
+            "    ├─ Frame Read (decode):   %.2fs (%s)\n"
+            "    ├─ Frame Resize:          %.2fs (%s)\n"
+            "    ├─ Processing (_process): %.2fs (%s)\n"
+            "    │   ├─ YOLO Detection:    %.2fs (%s)\n"
+            "    │   └─ ReID Extraction:   %.2fs (%s)\n"
+            "    ├─ Frame Write (encode):  %.2fs (%s)\n"
+            "    └─ DB Batch Flush:        %.2fs (%s)\n"
+            "  Phase 2 (Finalization):     %.2fs (%s)\n"
+            "  Overhead (misc):           %.2fs (%s)\n"
+            "───────────────────────────────────────────────────────────\n"
+            "  Local tracks: %d | Global IDs: %s\n"
+            "  Matched: %d | Unmatched: %d | Avg match score: %.4f\n"
+            "═══════════════════════════════════════════════════════════",
+            video_source,
+            elapsed_total,
+            frame_number, len(proc_times),
+            frame_number / elapsed_total if elapsed_total > 0 else 0.0,
+            phase1_duration, _pct(phase1_duration),
+            total_read, _pct(total_read),
+            total_resize, _pct(total_resize),
+            total_proc, _pct(total_proc),
+            total_yolo, _pct(total_yolo),
+            total_reid, _pct(total_reid),
+            total_write, _pct(total_write),
+            total_db, _pct(total_db),
+            total_finalize, _pct(total_finalize),
+            overhead, _pct(overhead),
+            len(local_profiles), unique_global_ids,
+            n_matched, unmatched, avg_match,
+        )
 
         return {
             "video_source":        video_source,
