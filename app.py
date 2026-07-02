@@ -208,6 +208,12 @@ with st.sidebar:
         help="If enabled, only people explicitly taught via the 'Teach Person' tab will be labeled. All others will be labeled as 'Unknown'."
     )
 
+    use_onnx = st.toggle(
+        "Enable ONNX Backend",
+        value=False,
+        help="Use ONNX for YOLO inference. Only beneficial if you have a supported GPU (CUDA). Can be slower on CPU-only machines."
+    )
+
     similarity_threshold = st.slider(
         "Cosine Similarity Threshold",
         min_value=0.50, max_value=0.99, value=0.70, step=0.01,
@@ -220,7 +226,7 @@ with st.sidebar:
 
     frame_skip = st.select_slider(
         "Frame Skip",
-        options=[1, 2, 3, 5], value=1,
+        options=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], value=1,
         help=(
             "Process every Nth frame.\n"
             "• 1 = all frames (slowest, best)\n"
@@ -425,6 +431,7 @@ with tab_upload:
             with settings_cols[0]:
                 st.metric("Similarity Threshold", f"{similarity_threshold:.2f}")
                 st.metric("Frame Skip", frame_skip)
+                st.metric("ONNX Enabled", "Yes" if use_onnx else "No")
             with settings_cols[1]:
                 st.metric("Gallery Size", gallery_size)
                 st.metric("Min Crop Confidence", f"{min_crop_quality:.2f}")
@@ -477,6 +484,7 @@ with tab_upload:
                     "min_crop_quality":     min_crop_quality,
                     "reid_model":           reid_model_key,
                     "supervised_mode":      str(supervised_mode).lower(),
+                    "use_onnx":             str(use_onnx).lower(),
                 }
                 if topology_parsed:
                     params["camera_topology"] = json.dumps(topology_parsed)

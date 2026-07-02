@@ -18,6 +18,13 @@ python-dotenv>=1.0.0            # Load .env variables
 ultralytics>=8.2.0              # YOLOv8 + ByteTrack (all-in-one package)
 opencv-python>=4.10.0           # Video I/O and frame processing
 
+# --- ONNX Runtime (faster inference backend) ---
+onnx>=1.16.0                    # ONNX model format + graph tools
+onnxruntime>=1.18.0             # CPU ONNX inference (used by Ultralytics automatically)
+# onnxruntime-gpu>=1.18.0       # Uncomment for GPU ONNX (replaces onnxruntime above)
+onnxslim>=0.1.31                # Graph simplification for exported ONNX models
+openvino>=2024.0.0              # Intel-optimised CPU inference backend (2-4× faster than PyTorch on CPU)
+
 # --- Deep Learning (Re-ID Feature Extraction) ---
 torch>=2.3.0                    # PyTorch (GPU-accelerated inference)
 torchvision>=0.18.0             # MobileNetV3 pretrained weights

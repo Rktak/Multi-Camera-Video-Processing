@@ -256,6 +256,7 @@ async def upload_videos(
     min_crop_quality: float = 0.40,
     reid_model: str = "osnet_ain",
     supervised_mode: bool = False,
+    use_onnx: bool = False,
 ) -> dict:
     """
     Accept multiple video uploads and start asynchronous processing.
@@ -335,6 +336,7 @@ async def upload_videos(
         reid_model=reid_model,
         reid_half=os.getenv("REID_HALF", "true").lower() in ("true", "1", "yes"),
         supervised_mode=supervised_mode,
+        use_onnx=use_onnx,
     )
 
     # Register job state
@@ -363,6 +365,7 @@ async def upload_videos(
             "min_crop_quality":     min_crop_quality,
             "camera_topology":      topology_dict,
             "reid_model":           reid_model,
+            "use_onnx":             use_onnx,
         },
     }
 

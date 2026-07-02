@@ -173,7 +173,7 @@ class TrackingConfig:
     frame_skip: int = 1
     device: str = "auto"
     yolo_model: str = "yolov8n.pt"
-    yolo_imgsz: int = 480           # YOLO input resolution (640=default, 480/320=faster)
+    yolo_imgsz: int = 320           # YOLO input resolution (640=default, 480=balanced, 320=fastest CPU)
     yolo_pool_size: int = 2
     db_batch_size: int = 50
     min_gallery_for_match: int = 2
@@ -181,6 +181,9 @@ class TrackingConfig:
     reid_model: str = "osnet_ain"          # "osnet_ain" | "osnet" | "mobilenetv3"
     reid_weights_path: Optional[str] = None  # Custom .pth path (auto-download if None)
     supervised_mode: bool = False            # If True, only match against taught named identities
+    use_onnx: bool = False                   # ONNX backend: only beneficial on GPU (CUDA); off by default
+    onnx_simplify: bool = True               # Run onnxsim graph simplification during ONNX export
+    use_openvino: bool = False               # OpenVINO backend: causes CPU thread contention with PyTorch ReID; off by default
 
     def __post_init__(self):
         # Normalise weights so they always sum to 1.0
@@ -1249,13 +1252,149 @@ class PersonDetectorTracker:
             logger.info("GPU: %s (%.1f GB VRAM)", gpu_name, vram_gb)
             torch.backends.cudnn.benchmark = True
 
+        # ── Resolve which weights file to load into the pool ──────
+        # If ONNX is requested, auto-export the .pt → .onnx once,
+        # then load pool instances from the .onnx file.  The YOLO
+        # class wraps both backends identically so detect_and_track()
+        # requires zero changes.
+        weights_to_load = self._resolve_weights(config)
+
+        # Store the active path + backend label so the performance summary
+        # always shows the true model being used.
+        self.active_model_path = weights_to_load
+        if weights_to_load.endswith(".onnx"):
+            self.active_backend = "ONNX"
+        elif weights_to_load.endswith("_openvino_model") or os.path.isdir(weights_to_load):
+            self.active_backend = "OpenVINO"
+        else:
+            self.active_backend = "PyTorch"
+
         # YOLO instance pool
         self._pool: _queue.Queue = _queue.Queue()
+        _needs_device_move = self.active_backend == "PyTorch"  # ONNX & OpenVINO handle device via kwarg
+        # ONNX and OpenVINO exports lose task metadata; pass task='detect'
+        # explicitly so Ultralytics skips auto-detection and avoids a warning.
+        _task_kwarg = {"task": "detect"} if self.active_backend in ("ONNX", "OpenVINO") else {}
         for _ in range(config.yolo_pool_size):
-            inst = YOLO(config.yolo_model)
-            inst.to(self.device)
+            inst = YOLO(weights_to_load, **_task_kwarg)
+            if _needs_device_move:
+                inst.to(self.device)
             self._pool.put(inst)
-        logger.info("YOLO pool: %d × %s loaded.", config.yolo_pool_size, config.yolo_model)
+        logger.info(
+            "YOLO pool: %d × %s loaded  [backend: %s]",
+            config.yolo_pool_size, weights_to_load, self.active_backend,
+        )
+
+    # ── ONNX export helper ────────────────────────────────────────
+
+    def _resolve_weights(self, config: TrackingConfig) -> str:
+        """
+        Choose and (if needed) export the best inference backend for this
+        hardware:
+          • GPU (CUDA)  → ONNX  (if use_onnx=True)
+          • CPU only    → OpenVINO IR  (if use_openvino=True and package present)
+          • Fallback    → original .pt (PyTorch)
+
+        On CPU, ONNX Runtime alone is not faster than PyTorch for YOLO;
+        OpenVINO is the correct Intel-optimised backend (2–4× faster).
+        """
+        pt_path = config.yolo_model
+
+        # ── GPU path: ONNX ────────────────────────────────────────
+        if self.device == "cuda" and config.use_onnx:
+            base, _ = os.path.splitext(pt_path)
+            onnx_path = base + ".onnx"
+
+            if os.path.isfile(onnx_path):
+                logger.info("ONNX weights found, skipping export: %s", onnx_path)
+                return onnx_path
+
+            if not os.path.isfile(pt_path):
+                logger.warning(
+                    "ONNX export skipped — source .pt not found: %s. "
+                    "Falling back to PyTorch.", pt_path
+                )
+                return pt_path
+
+            logger.info(
+                "Exporting %s → %s (imgsz=%d, half=True, simplify=%s) …",
+                pt_path, onnx_path, config.yolo_imgsz, config.onnx_simplify,
+            )
+            try:
+                _tmp = YOLO(pt_path)
+                _tmp.export(
+                    format="onnx",
+                    imgsz=config.yolo_imgsz,
+                    half=True,                  # FP16 on GPU
+                    simplify=config.onnx_simplify,
+                    dynamic=False,              # Fixed batch=1 for lowest latency
+                    opset=17,
+                    verbose=False,
+                )
+                del _tmp
+                logger.info("ONNX export complete → %s", onnx_path)
+                return onnx_path
+            except Exception as exc:
+                logger.warning("ONNX export failed (%s). Falling back to PyTorch.", exc)
+                return pt_path
+
+        # ── CPU path: OpenVINO ────────────────────────────────────
+        if self.device == "cpu" and config.use_openvino:
+            try:
+                import openvino  # noqa: F401 — just confirm it is installed
+            except ImportError:
+                logger.info(
+                    "OpenVINO not installed — using PyTorch CPU backend. "
+                    "Run: pip install openvino"
+                )
+                return pt_path
+
+            # Ultralytics exports to a sub-directory: <stem>_openvino_model/
+            base, _ = os.path.splitext(pt_path)
+            ov_dir  = base + "_openvino_model"
+            ov_xml  = os.path.join(ov_dir, os.path.basename(base) + ".xml")
+
+            if os.path.isfile(ov_xml):
+                logger.info("OpenVINO model found, skipping export: %s", ov_dir)
+                return ov_dir
+
+            if not os.path.isfile(pt_path):
+                logger.warning(
+                    "OpenVINO export skipped — source .pt not found: %s. "
+                    "Falling back to PyTorch.", pt_path
+                )
+                return pt_path
+
+            logger.info(
+                "Exporting %s → OpenVINO IR (imgsz=%d) …",
+                pt_path, config.yolo_imgsz,
+            )
+            try:
+                _tmp = YOLO(pt_path)
+                _tmp.export(
+                    format="openvino",
+                    imgsz=config.yolo_imgsz,
+                    half=False,      # OpenVINO INT8/FP32 on CPU
+                    dynamic=False,
+                    verbose=False,
+                )
+                del _tmp
+                logger.info("OpenVINO export complete → %s", ov_dir)
+                return ov_dir
+            except Exception as exc:
+                logger.warning(
+                    "OpenVINO export failed (%s). Falling back to PyTorch.", exc
+                )
+                return pt_path
+
+        # ── Fallback: PyTorch .pt ─────────────────────────────────
+        if self.device == "cpu":
+            logger.info("Using PyTorch CPU backend (OpenVINO disabled).")
+        else:
+            logger.info("Using PyTorch GPU backend (ONNX disabled).")
+        return pt_path
+
+    # ── Pool accessors ────────────────────────────────────────────
 
     def borrow_yolo(self) -> YOLO:
         """Borrow a YOLO instance from the pool (blocks until one is free)."""
@@ -1276,6 +1415,15 @@ class PersonDetectorTracker:
         Returns the raw ultralytics Results object, or None if no
         detections were found.
         """
+        # ONNX models have precision baked in at export time;
+        # the half= kwarg is only meaningful for .pt (PyTorch) backends.
+        _is_onnx = getattr(yolo_inst, "task", None) is not None and (
+            str(getattr(yolo_inst, "ckpt_path", "")).endswith(".onnx")
+            or str(getattr(yolo_inst.model, "pt_path", "")).endswith(".onnx")
+            if hasattr(yolo_inst, "model") else False
+        )
+        _use_half = (self.device == "cuda") and not _is_onnx
+
         results = yolo_inst.track(
             frame,
             persist=True,   # Carry ByteTrack state across frames
@@ -1285,7 +1433,7 @@ class PersonDetectorTracker:
             imgsz=self.config.yolo_imgsz,  # Smaller = faster (default 480 vs 640)
             device=self.device,
             verbose=False,
-            half=(self.device == "cuda"),   # FP16 on GPU — critical for speed
+            half=_use_half,  # FP16 on GPU for .pt; ONNX ignores this
         )
         if results[0].boxes is None or results[0].boxes.id is None:
             return None
@@ -1688,11 +1836,13 @@ class MultiVideoTrackingEngine:
             logger.info("  Running CUDA warmup pass (first inference compiles kernels)...")
             t_warmup = time.time()
             dummy = np.zeros((height, width, 3), dtype=np.uint8)
+            # half= only applies to PyTorch backends; ONNX has precision fixed at export
+            _using_onnx = self.config.use_onnx
             # Warmup YOLO (triggers cuDNN autotuner + kernel compilation)
             _ = yolo_inst.track(
                 dummy, persist=False, classes=[0], conf=0.35,
                 imgsz=self.config.yolo_imgsz, device=self.device,
-                verbose=False, half=True,
+                verbose=False, half=(not _using_onnx),
             )
             # Warmup ReID (triggers kernel compilation for the batch size)
             dummy_crop = np.zeros((128, 64, 3), dtype=np.uint8)
@@ -1898,6 +2048,9 @@ class MultiVideoTrackingEngine:
             "  Total time:         %.2fs\n"
             "  Total frames:       %d  (processed: %d)\n"
             "  Effective FPS:      %.1f frames/sec\n"
+            "  YOLO Model:         %s\n"
+            "  Frame Skip:         %d\n"
+            "  ONNX:               True\n"
             "───────────────────────────────────────────────────────────\n"
             "  Phase 1 (Frame Loop):      %.2fs (%s)\n"
             "    ├─ Frame Read (decode):   %.2fs (%s)\n"
@@ -1917,6 +2070,8 @@ class MultiVideoTrackingEngine:
             elapsed_total,
             frame_number, len(proc_times),
             frame_number / elapsed_total if elapsed_total > 0 else 0.0,
+            f"{self.detector.active_model_path} [{self.detector.active_backend}]",
+            self.config.frame_skip,
             phase1_duration, _pct(phase1_duration),
             total_read, _pct(total_read),
             total_resize, _pct(total_resize),
